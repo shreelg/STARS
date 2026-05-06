@@ -1,0 +1,136 @@
+import json
+import re
+from groq import Groq
+
+api_key = "YOUR_API_KEY"
+data_file = "combined_papers.json"
+model_name = "llama-3.1-8b-instant"
+max_papers = 15
+
+client = Groq(api_key=api_key)
+
+with open(data_file, "r", encoding="utf-8") as f:
+    raw_data = json.load(f)
+
+papers = raw_data if isinstance(raw_data, list) else [raw_data]
+
+print(f"Loaded {len(papers)} papers. Ask a question or type 'q' to quit.\n")
+
+
+def get_relevant_papers(query, top_k=max_papers):
+    stopwords = {
+        "a","an","the","is","are","was","were","in","on","of","to",
+        "for","and","or","with","about","give","me","show","find",
+        "list","get","what","which","how","paper","papers","reviews"
+    }
+
+    words = re.findall(r"\w+", query.lower())
+    keywords = [w for w in words if len(w) > 2 and w not in stopwords]
+
+    paper_id_match = re.findall(r"\b\d{4}-\d+\b", query)
+
+    scored_papers = []
+
+    for paper in papers:
+        score = 0
+
+        searchable_text = (
+            (paper.get("title") or "") + " " +
+            (paper.get("text") or "")[:1000] + " " +
+            (paper.get("decision") or "") + " " +
+            (paper.get("paper_id") or "")
+        ).lower()
+
+        if paper_id_match and paper.get("paper_id") in paper_id_match:
+            score += 1000
+
+        for word in keywords:
+            if word in searchable_text:
+                score += 1
+            if word in (paper.get("title") or "").lower():
+                score += 3
+
+        try:
+            avg_score = float(paper.get("avg_score") or 0)
+            score_targets = re.findall(r"\b([5-9]|10)\b", query)
+            if score_targets:
+                threshold = max(float(x) for x in score_targets)
+                if avg_score >= threshold:
+                    score += 2
+        except:
+            pass
+
+        scored_papers.append((score, paper))
+
+    scored_papers.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored_papers[:top_k]]
+
+
+def format_papers(papers_subset):
+    formatted = []
+
+    for paper in papers_subset:
+        formatted.append(
+            f"[{paper['paper_id']}] {paper.get('title', '')}\n"
+            f"Decision: {paper.get('decision', '')} | "
+            f"Avg score: {float(paper.get('avg_score') or 0):.2f} | "
+            f"Scores: {paper.get('review_scores', '').strip()}\n"
+            f"Excerpt: {(paper.get('text') or '')[:600].replace(chr(10), ' ')}"
+        )
+
+    return "\n\n---\n\n".join(formatted)
+
+
+system_prompt = """
+You are a research assistant for academic paper reviews from ML/AI conferences.
+
+You are given:
+- a user question
+- a filtered list of relevant papers
+
+Answer using only the provided papers.
+Reference paper IDs and titles when needed.
+Be clear, accurate, and natural.
+"""
+
+
+history = []
+
+while True:
+    try:
+        user_query = input("\nYou: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nBye.")
+        break
+
+    if not user_query:
+        continue
+    if user_query.lower() in ("q", "quit", "exit"):
+        print("Bye.")
+        break
+
+    relevant_papers = get_relevant_papers(user_query)
+    paper_context = format_papers(relevant_papers)
+
+    prompt = (
+        f"User question: {user_query}\n\n"
+        f"Relevant papers ({len(relevant_papers)} shown out of {len(papers)} total):\n\n"
+        f"{paper_context}"
+    )
+
+    history.append({"role": "user", "content": prompt})
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "system", "content": system_prompt}] + history,
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        answer = f"[Error: {e}]"
+        history.pop()
+
+    if "[Error" not in answer:
+        history.append({"role": "assistant", "content": answer})
+
+    print(f"\nAssistant: {answer}\n")
